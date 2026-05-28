@@ -1,0 +1,8 @@
+{
+  "reminders": [
+    {
+      "at": "2026-04-11T16:00:00",
+      "prompt": "In ~/reversal-research: (1) List files in experiments/ matching pattern [0-9][0-9][0-9]-*.md. (2) For each file, give a short summary: title, Data tier, core hypothesis, and whether it requires comparison to Baseline_buy_hold_ew_no_rebal_cost in the evaluation section. (3) If there are no numbered experiment specs, read .cache/experiment_discovery_run.log (if it exists) for errors and report status of any run_experiment_discovery_agent / cursor agent process. Keep the reply concise for Telegram."
+    }
+  ]
+}

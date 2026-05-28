@@ -1,0 +1,14 @@
+# Fires every minute so run_reminders.py can send due reminders.
+# Install: copy to ~/.config/systemd/user/
+#   systemctl --user enable --now telegram-reminders.timer
+
+[Unit]
+Description=Every minute: check and send due Telegram reminders
+
+[Timer]
+OnCalendar=*-*-* *:*:00
+AccuracySec=1
+Persistent=true
+
+[Install]
+WantedBy=timers.target
