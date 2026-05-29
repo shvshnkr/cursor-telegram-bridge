@@ -3,21 +3,25 @@
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_ALLOWED_USER_ID=
 
-# Cursor CLI workspace (Dahusim logs, code edits, etc.)
-CURSOR_WORKSPACE=C:\Users\user\DaiHusim
+# Absolute path to project for cursor agent --workspace
+CURSOR_WORKSPACE=
 
-# CLI: leave empty for auto-detect (agent vs cursor agent on Windows)
+# CLI: leave empty for auto-detect (Windows: agent via cmd.exe /c agent.CMD)
 CURSOR_CLI=
 
 # Default mode when message has no /ask /plan /agent prefix: ask | plan | agent
 CURSOR_AGENT_MODE=agent
 
-# Cursor model (Auto recommended for Composer 2.5 routing)
+# Cursor model (Auto recommended)
 CURSOR_AGENT_MODEL=Auto
 
-# 0 = unlimited agent run time
+# Reply language: ru = answers in Russian
+CURSOR_AGENT_LANGUAGE=ru
+
+# Agent subprocess timeout in seconds; 0 = unlimited
 CURSOR_AGENT_TIMEOUT=0
 
 # SOCKS5 chain for Telegram API only (not passed to cursor agent)
-# socks5h = DNS via proxy (needed for api.telegram.org on restricted networks)
-PROXY_SOCKS5_URLS=socks5h://127.0.0.1:2181,socks5h://127.0.0.1:2080,socks5h://192.168.1.96:11080
+# Example: socks5h://127.0.0.1:1080,socks5h://127.0.0.1:2080
+# Leave empty if api.telegram.org is reachable directly
+PROXY_SOCKS5_URLS=

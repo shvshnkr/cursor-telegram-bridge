@@ -15,6 +15,7 @@ DEFAULTS: Dict[str, str] = {
     "CURSOR_AGENT_TIMEOUT": "0",
     "CURSOR_AGENT_MODE": "agent",
     "CURSOR_AGENT_MODEL": "Auto",
+    "CURSOR_AGENT_LANGUAGE": "ru",
     "CURSOR_WORKSPACE": "",
     "CURSOR_CLI": "",
     "PROXY_SOCKS5_URLS": "",
@@ -98,30 +99,60 @@ def get_default_mode(cfg: Dict[str, str]) -> str:
     return mode
 
 
+def get_agent_language(cfg: Dict[str, str]) -> str:
+    return (cfg.get("CURSOR_AGENT_LANGUAGE") or "ru").strip().lower() or "ru"
+
+
 def session_file_for_mode(mode: str) -> str:
     safe = mode if mode in ("ask", "plan", "agent") else "agent"
     return os.path.join(SCRIPT_DIR, ".cursor_agent_session.%s" % safe)
 
 
+def resolve_cli_argv(argv: List[str]) -> List[str]:
+    """
+    Resolve CLI executable to a path subprocess can spawn on Windows.
+    .cmd/.bat wrappers (Cursor agent installer) need cmd.exe /c.
+    """
+    if not argv:
+        return argv
+    exe = argv[0]
+    if os.path.isabs(exe) and os.path.isfile(exe):
+        resolved = exe
+    else:
+        resolved = (
+            shutil.which(exe)
+            or shutil.which(exe + ".cmd")
+            or shutil.which(exe + ".exe")
+            or exe
+        )
+    if os.name == "nt" and resolved.lower().endswith((".cmd", ".bat")):
+        return ["cmd.exe", "/c", resolved] + argv[1:]
+    if resolved != exe:
+        return [resolved] + argv[1:]
+    return argv
+
+
 def detect_cursor_cli(preferred: str = "") -> List[str]:
-    """Return argv prefix for Cursor CLI, e.g. ['agent'] or ['cursor', 'agent']."""
+    """Return argv prefix for Cursor CLI, e.g. cmd.exe /c agent.cmd or ['cursor', 'agent']."""
     pref = (preferred or "").strip()
     if pref:
-        return pref.split()
-    if shutil.which("agent"):
+        return resolve_cli_argv(pref.split())
+    agent_path = shutil.which("agent") or shutil.which("agent.cmd")
+    if agent_path:
+        argv = resolve_cli_argv(["agent"])
         try:
             subprocess.run(
-                ["agent", "--version"],
+                argv + ["--version"],
                 capture_output=True,
-                timeout=10,
+                timeout=15,
                 check=False,
             )
-            return ["agent"]
+            return argv
         except (OSError, subprocess.TimeoutExpired):
             pass
     if shutil.which("cursor"):
         return ["cursor", "agent"]
-    return ["cursor", "agent"]
+    return resolve_cli_argv(["agent"])
 
 
 def get_cursor_cli(cfg: Dict[str, str]) -> List[str]:

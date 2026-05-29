@@ -1,12 +1,12 @@
 # Cursor: how-to для cursor-telegram-bridge
 
-Подход адаптирован из [Dahusim docs/CURSOR-HOWTO-RU](https://github.com/shvshnkr/dahusim).  
 **Цель — оптимальный расход контекста и лимитов Cursor 2.5 Auto, не «экономия любой ценой».**
 
 ## Контекст и окна агента
 
 - **Новый чат Agent/Composer** — на каждую крупную задачу (новый патч, другой баг, смена архитектуры). Длинная переписка съедает контекст; модель путает ветки и ранние решения.
-- **Telegram `--resume`** — один непрерывный поток в боте. Сменили тему → `/reset` в Telegram или новый чат в Cursor Desktop.
+- **Telegram `--resume`** — один непрерывный поток в боте. Сменили тему → `/reset`, `/new имя` или новый чат в Cursor Desktop.
+- **Именованные сессии** — `/new feature-x`, `/use bugfix`; см. README.
 - **Plan mode** (`/plan`) — перед большим diff: согласовать scope, не править код до подтверждения.
 - **@‑файлы** — 3–8 ключевых файлов, не весь репозиторий.
 - **Фоновый explore** — отдельный subagent; основной чат — для правок.
@@ -28,18 +28,18 @@
 
 ## Этот репозиторий (бот)
 
-- Правила агента: [`AGENTS.md`](../AGENTS.md)
-- Конфиг: `telegram-bot/config.example`
+- Локальные правила Cursor: `AGENTS.md` в корне (в `.gitignore`, не пушится)
+- Конфиг: `telegram-bot/config.example` → `telegram-bot/config`
 - Коммиты — только по явной просьбе
 - Proxy только для Telegram; `cursor agent` — локально, без SOCKS
 
-## Dahusim workspace
+## Внешний workspace (`CURSOR_WORKSPACE`)
 
-Если `CURSOR_WORKSPACE` указывает на Dahusim:
+Если бот указывает на другой проект (не этот репозиторий):
 
-1. Не делать repo-wide explore — см. `AI/symptoms-index.toml` → нужный `.kt`
-2. Лог simple-mode: grep H24, H37, H4, H1 (см. Dahusim CURSOR-HOWTO)
-3. Файлы из Telegram: `AI/incoming-logs/` (gitignored в Dahusim)
+1. Не делать repo-wide explore — указывайте конкретные файлы или симптомы
+2. Логи из Telegram сохраняются в `{workspace}/AI/incoming-logs/` (если настроен triage)
+3. Правила агента для того проекта — в его корне или в локальном `AGENTS.md`
 
 ## Когда сменить чат (чеклист)
 
@@ -54,7 +54,7 @@
 ```
 Симптом: …
 Режим: /ask или /agent
-Workspace: DaiHusim / cursor-telegram-bridge
+Workspace: путь из CURSOR_WORKSPACE
 Ограничение: не трогать X, только Y
-Лог/файл: @path или приложить husi_simple_log_*.txt
+Лог/файл: @path или приложить документ
 ```

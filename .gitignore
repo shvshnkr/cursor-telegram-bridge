@@ -1,16 +1,29 @@
-# Secrets and runtime state
+# Secrets and local config
 .env
 *.env.local
 telegram-bot/config
+
+# Agent / IDE local rules (not for public repo)
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+.cursor/
+
+# Runtime session state
 telegram-bot/.cursor_agent_session*
+telegram-bot/named_sessions.json
 telegram-bot/chat_id
 telegram-bot/.telegram_offset
 telegram-bot/reminders.json
+
+# Received media and logs (may contain private chats)
 telegram-bot/received_images/
 telegram-bot/received_documents/
 telegram-bot/logs/
 telegram-bot/pending_images/
 telegram-bot/pending_attachments/
+
+# Python / venv
 __pycache__/
 *.pyc
 .venv/

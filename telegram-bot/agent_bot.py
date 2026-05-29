@@ -23,6 +23,7 @@ from typing import Dict, List, Optional, Tuple
 
 from config_loader import (
     REPO_ROOT,
+    get_agent_language,
     get_agent_timeout,
     get_cursor_cli,
     get_default_mode,
@@ -33,6 +34,7 @@ from config_loader import (
     session_file_for_mode,
 )
 import proxy
+import named_sessions
 
 TYPING_INTERVAL = 4
 BASE = "https://api.telegram.org/bot"
@@ -45,6 +47,7 @@ LOGS_DIR = os.path.join(SCRIPT_DIR, "logs")
 PENDING_IMAGES_DIR = os.path.join(SCRIPT_DIR, "pending_images")
 PENDING_ATTACHMENTS_DIR = os.path.join(SCRIPT_DIR, "pending_attachments")
 LOG_TRIAGE_PROMPT = os.path.join(SCRIPT_DIR, "prompts", "log-triage.md")
+TELEGRAM_SESSION_PROMPT = os.path.join(SCRIPT_DIR, "prompts", "telegram-session.md")
 HUSI_LOG_GLOB = "husi_simple_log_*.txt"
 
 _CFG: Dict[str, str] = {}
@@ -55,6 +58,38 @@ _CURSOR_CLI: List[str] = ["cursor", "agent"]
 _DEFAULT_MODE = "agent"
 _MODE_SESSIONS: Dict[str, Optional[str]] = {"ask": None, "plan": None, "agent": None}
 
+_RU_LANG_CODES = frozenset({"ru", "rus", "russian", "рус", "русский"})
+
+
+def _agent_subprocess_env() -> Dict[str, str]:
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+    return env
+
+
+def _wrap_telegram_prompt(prompt: str, resume_session: Optional[str]) -> str:
+    """Wrap user prompt without hijacking the task (language rule only as brief suffix on resume)."""
+    lang = get_agent_language(_CFG)
+    if lang not in _RU_LANG_CODES:
+        return prompt
+
+    brief_suffix = "\n\n(Ответь по существу на русском. Не повторяй инструкции — только результат.)"
+
+    if resume_session:
+        return prompt + brief_suffix
+
+    header = ""
+    if os.path.isfile(TELEGRAM_SESSION_PROMPT):
+        with open(TELEGRAM_SESSION_PROMPT, encoding="utf-8") as f:
+            header = f.read().format(workspace=_WORKSPACE)
+    else:
+        header = (
+            "Telegram-бот. Workspace: %s. Отвечай на русском по существу. "
+            "Не подтверждай инструкции.\n\nЗапрос пользователя:\n"
+        ) % _WORKSPACE
+    return header + prompt
+
 
 def _init_runtime() -> None:
     global _CFG, _TOKEN, _ALLOWED_USER_ID, _WORKSPACE, _CURSOR_CLI, _DEFAULT_MODE
@@ -64,6 +99,8 @@ def _init_runtime() -> None:
     _CURSOR_CLI = get_cursor_cli(_CFG)
     _DEFAULT_MODE = get_default_mode(_CFG)
     proxy.configure(get_proxy_urls(_CFG))
+    named_sessions.configure(_CURSOR_CLI, _WORKSPACE)
+    named_sessions.load()
     for mode in ("ask", "plan", "agent"):
         _MODE_SESSIONS[mode] = _load_session(mode)
 
@@ -415,7 +452,7 @@ def run_agent_streaming(
         cmd.extend(["--mode", "plan"])
     if resume_session:
         cmd.extend(["--resume", resume_session])
-    cmd.append(prompt)
+    cmd.append(_wrap_telegram_prompt(prompt, resume_session))
 
     timeout_sec = get_agent_timeout(_CFG)
     full_stdout_lines: List[str] = []
@@ -436,7 +473,10 @@ def run_agent_streaming(
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 bufsize=1,
+                env=_agent_subprocess_env(),
             )
             proc_ref[0] = proc
             try:
@@ -522,32 +562,73 @@ def run_agent_streaming(
 
 
 def _handle_control(chat_id: int, text: str) -> bool:
-    stripped = text.strip().lower()
-    if stripped == "/mode":
+    handled, reply = named_sessions.handle_command(text)
+    if handled:
+        send_message(chat_id, reply or "(ok)")
+        return True
+
+    stripped = text.strip()
+    lower = stripped.lower()
+    parts = stripped.split()
+
+    if lower == "/mode":
+        active = named_sessions.get_active_name()
         send_message(
             chat_id,
-            "Default mode: `%s`\nSessions: ask=%s, plan=%s, agent=%s\n"
-            "Commands: /ask, /plan, /agent, /reset (new session), /newchat (hint)"
+            "Default mode: `%s`\nActive named: `%s`\n"
+            "Mode sessions: ask=%s, plan=%s, agent=%s\n\n"
+            "%s"
             % (
                 _DEFAULT_MODE,
+                active or "(none)",
                 "yes" if _MODE_SESSIONS.get("ask") else "no",
                 "yes" if _MODE_SESSIONS.get("plan") else "no",
                 "yes" if _MODE_SESSIONS.get("agent") else "no",
+                named_sessions.session_help_text(),
             ),
         )
         return True
-    if stripped in ("/reset", "/newchat"):
-        if stripped == "/reset":
+
+    if lower == "/newchat":
+        send_message(
+            chat_id,
+            "Новый контекст:\n"
+            "- `/new bugfix` — именованная сессия (create-chat)\n"
+            "- `/reset` — сброс mode + снять active\n"
+            "- или новый чат в Cursor Desktop",
+        )
+        return True
+
+    if parts and parts[0].lower() == "/reset":
+        if len(parts) == 1:
             for mode in ("ask", "plan", "agent"):
                 _save_session(mode, None)
-            send_message(chat_id, "Sessions cleared for ask/plan/agent.")
-        else:
+            named_sessions.clear_active()
             send_message(
                 chat_id,
-                "Для свежего контекста: /reset здесь или новый чат в Cursor Desktop. "
-                "Длинная сессия в Telegram = один --resume; при больших задачах лучше /reset.",
+                "Сброшено: ask/plan/agent sessions + active именованная.\n"
+                "Именованные записи в `/sessions` сохранены (id остались). "
+                "Удалить: `/drop all`.",
             )
+            return True
+        target = parts[1].lower()
+        if target in ("ask", "plan", "agent"):
+            _save_session(target, None)
+            send_message(chat_id, "Session `%s` cleared." % target)
+            return True
+        if target == "all":
+            for mode in ("ask", "plan", "agent"):
+                _save_session(mode, None)
+            named_sessions.clear_active()
+            send_message(chat_id, "Mode sessions + active cleared.")
+            return True
+        try:
+            named_sessions.drop_named(parts[1])
+            send_message(chat_id, "Именованная сессия `%s` удалена." % parts[1])
+        except ValueError as e:
+            send_message(chat_id, str(e))
         return True
+
     return False
 
 
@@ -675,11 +756,20 @@ def main():
         if not text.strip():
             continue
 
-        print("Running agent mode=%s prompt: %s..." % (mode, text[:60]), file=sys.stderr)
+        print("Running agent mode=%s active=%s prompt: %s..." % (
+            mode,
+            named_sessions.get_active_name() or "-",
+            text[:60],
+        ), file=sys.stderr)
         send_chat_action(chat_id, "typing")
-        resume = _MODE_SESSIONS.get(mode)
+        resume = named_sessions.get_active_session_id()
+        if not resume:
+            resume = _MODE_SESSIONS.get(mode)
         session_id = run_agent_streaming(text, mode, resume, chat_id)
-        _save_session(mode, session_id)
+        if named_sessions.get_active_name():
+            named_sessions.update_active_session_id(session_id)
+        else:
+            _save_session(mode, session_id)
 
 
 if __name__ == "__main__":
