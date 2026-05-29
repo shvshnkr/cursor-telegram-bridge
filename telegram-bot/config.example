@@ -6,7 +6,9 @@ TELEGRAM_ALLOWED_USER_ID=
 # Absolute path to project for cursor agent --workspace
 CURSOR_WORKSPACE=
 
-# CLI: leave empty for auto-detect (Windows: agent via cmd.exe /c agent.CMD)
+# CLI: leave empty for auto-detect (Windows: %LOCALAPPDATA%\cursor-agent\agent.cmd)
+# If background bot reports WinError 2, set full path, e.g.:
+# CURSOR_CLI=C:\Users\user\AppData\Local\cursor-agent\agent.cmd
 CURSOR_CLI=
 
 # Default mode when message has no /ask /plan /agent prefix: ask | plan | agent
@@ -18,10 +20,19 @@ CURSOR_AGENT_MODEL=Auto
 # Reply language: ru = answers in Russian
 CURSOR_AGENT_LANGUAGE=ru
 
-# Agent subprocess timeout in seconds; 0 = unlimited
+# Wall-clock limit for one agent run (seconds); 0 = unlimited (fine for 8+ min log triage)
 CURSOR_AGENT_TIMEOUT=0
+
+# Stop if CLI prints nothing for N seconds (thinking/stream-json lines count as activity).
+# Catches stuck Allow/MCP prompts without cutting long runs that keep streaming. 0 = off.
+CURSOR_AGENT_IDLE_TIMEOUT=1200
 
 # SOCKS5 chain for Telegram API only (not passed to cursor agent)
 # Example: socks5h://127.0.0.1:1080,socks5h://127.0.0.1:2080
 # Leave empty if api.telegram.org is reachable directly
 PROXY_SOCKS5_URLS=
+
+# Dialog log for local debugging (off by default). When 1: writes
+# telegram-bot/logs/dialog-latest.txt and dialog-YYYY-MM-DD.jsonl
+TELEGRAM_DIALOG_LOG=0
+# TELEGRAM_DIALOG_LOG_DIR=

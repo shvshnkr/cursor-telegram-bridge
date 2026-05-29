@@ -28,10 +28,23 @@
 
 ## Этот репозиторий (бот)
 
+- **Таймауты:** `CURSOR_AGENT_TIMEOUT=0` — долгие ответы (лог 8+ мин) не режутся. `CURSOR_AGENT_IDLE_TIMEOUT=1200` (по умолчанию) — если CLI **полностью** молчит 20 мин (зависание на Allow/MCP), бот убьёт процесс и примет следующее сообщение; любая строка stdout, в т.ч. `thinking`, сбрасывает idle.
+- **Устойчивость:** сбой Telegram API при отправке не завершает процесс бота; повторы и fallback финального ответа. Агент крутится в фоне — polling и `/stop`, `/sessions`, `/mode` работают во время run. Меню: `/start`, клавиатура, `setMyCommands`.
+- **Лог диалога (тесты):** `TELEGRAM_DIALOG_LOG=1` в config → `telegram-bot/logs/dialog-latest.txt` (входящие, ответы, attach, ошибки). По умолчанию выключено.
 - Локальные правила Cursor: `AGENTS.md` в корне (в `.gitignore`, не пушится)
 - Конфиг: `telegram-bot/config.example` → `telegram-bot/config`
 - Коммиты — только по явной просьбе
 - Proxy только для Telegram; `cursor agent` — локально, без SOCKS
+
+## Файлы из агента в Telegram
+
+В `/agent` агент может отправить файл пользователю:
+
+- `python "%CURSOR_TELEGRAM_ATTACH%" file.txt` — в очередь, уйдёт со следующим сообщением бота
+- `--now` — сразу через Bot API
+- `[TG_FILE:path]` в тексте ответа — без shell (путь от workspace)
+
+Скрипты лежат в каталоге **cursor-telegram-bridge**, не обязательно в `CURSOR_WORKSPACE`.
 
 ## Внешний workspace (`CURSOR_WORKSPACE`)
 

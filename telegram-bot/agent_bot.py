@@ -19,14 +19,17 @@ import time
 import urllib.error
 import urllib.request
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from config_loader import (
     REPO_ROOT,
     get_agent_language,
+    get_agent_idle_timeout,
     get_agent_timeout,
     get_cursor_cli,
     get_default_mode,
+    get_dialog_log_dir,
+    get_dialog_log_enabled,
     get_proxy_urls,
     get_workspace,
     load_config,
@@ -35,8 +38,14 @@ from config_loader import (
 )
 import proxy
 import named_sessions
+import outbound
+import dialog_log
+from agent_runtime import get_runtime
+import telegram_menu
 
 TYPING_INTERVAL = 4
+SEND_RETRIES = 3
+SEND_RETRY_DELAY = 2
 BASE = "https://api.telegram.org/bot"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CHAT_ID_FILE = os.path.join(SCRIPT_DIR, "chat_id")
@@ -44,9 +53,11 @@ OFFSET_FILE = os.path.join(SCRIPT_DIR, ".telegram_offset")
 RECEIVED_IMAGES_DIR = os.path.join(SCRIPT_DIR, "received_images")
 RECEIVED_DOCUMENTS_DIR = os.path.join(SCRIPT_DIR, "received_documents")
 LOGS_DIR = os.path.join(SCRIPT_DIR, "logs")
-PENDING_IMAGES_DIR = os.path.join(SCRIPT_DIR, "pending_images")
-PENDING_ATTACHMENTS_DIR = os.path.join(SCRIPT_DIR, "pending_attachments")
 LOG_TRIAGE_PROMPT = os.path.join(SCRIPT_DIR, "prompts", "log-triage.md")
+TG_FILE_MARKER_RE = re.compile(
+    r"\[(?:TG_FILE|TG_ATTACH):([^\]]+)\]",
+    re.IGNORECASE,
+)
 TELEGRAM_SESSION_PROMPT = os.path.join(SCRIPT_DIR, "prompts", "telegram-session.md")
 HUSI_LOG_GLOB = "husi_simple_log_*.txt"
 
@@ -65,6 +76,25 @@ def _agent_subprocess_env() -> Dict[str, str]:
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
+    env["CURSOR_TELEGRAM_BRIDGE"] = REPO_ROOT
+    attach = os.path.join(SCRIPT_DIR, "attach_file.py")
+    env["CURSOR_TELEGRAM_ATTACH"] = attach
+    env["CURSOR_TELEGRAM_PYTHON"] = sys.executable
+    if os.name == "nt":
+        root = env.get("SystemRoot", r"C:\Windows")
+        sys32 = os.path.join(root, "System32")
+        path = env.get("PATH", "")
+        for extra in (sys32, os.path.join(sys32, "WindowsPowerShell", "v1.0")):
+            if extra.lower() not in path.lower():
+                path = extra + os.pathsep + path
+        local = env.get("LOCALAPPDATA", "")
+        if local:
+            agent_bin = os.path.join(local, "cursor-agent")
+            if os.path.isdir(agent_bin) and agent_bin.lower() not in path.lower():
+                path = agent_bin + os.pathsep + path
+        env["PATH"] = path
+        if "ComSpec" not in env and os.path.isfile(os.path.join(sys32, "cmd.exe")):
+            env["ComSpec"] = os.path.join(sys32, "cmd.exe")
     return env
 
 
@@ -74,10 +104,16 @@ def _wrap_telegram_prompt(prompt: str, resume_session: Optional[str]) -> str:
     if lang not in _RU_LANG_CODES:
         return prompt
 
-    brief_suffix = "\n\n(Ответь по существу на русском. Не повторяй инструкции — только результат.)"
+    attach = os.environ.get("CURSOR_TELEGRAM_ATTACH", "")
+    py = os.environ.get("CURSOR_TELEGRAM_PYTHON", "python")
+    brief_suffix = (
+        "\n\n(Ответь по существу на русском. Не повторяй инструкции — только результат. "
+        "Файлы в Telegram: `\"%s\" \"%s\" --now путь` или [TG_FILE:путь] — не пиши только путь на диске.)"
+        % (py, attach)
+    )
 
     if resume_session:
-        return prompt + brief_suffix
+        return prompt + brief_suffix + _delivery_prompt_suffix(prompt)
 
     header = ""
     if os.path.isfile(TELEGRAM_SESSION_PROMPT):
@@ -88,7 +124,7 @@ def _wrap_telegram_prompt(prompt: str, resume_session: Optional[str]) -> str:
             "Telegram-бот. Workspace: %s. Отвечай на русском по существу. "
             "Не подтверждай инструкции.\n\nЗапрос пользователя:\n"
         ) % _WORKSPACE
-    return header + prompt
+    return header + prompt + _delivery_prompt_suffix(prompt)
 
 
 def _init_runtime() -> None:
@@ -103,6 +139,12 @@ def _init_runtime() -> None:
     named_sessions.load()
     for mode in ("ask", "plan", "agent"):
         _MODE_SESSIONS[mode] = _load_session(mode)
+    dialog_log.configure(get_dialog_log_enabled(_CFG), get_dialog_log_dir(_CFG))
+    if dialog_log.is_enabled():
+        print("Dialog log: %s" % dialog_log.txt_path(), file=sys.stderr)
+        print("Dialog JSONL: %s" % dialog_log.jsonl_path(), file=sys.stderr)
+        dialog_log.log_system("bot_started", workspace=_WORKSPACE, cli=" ".join(_CURSOR_CLI))
+    telegram_menu.register_bot_commands(api)
 
 
 def api(method, **params):
@@ -139,119 +181,130 @@ def collapse_blank_lines(text: str) -> str:
     return "\n".join(result)
 
 
-def send_message(chat_id, text, parse_mode="Markdown"):
+def send_message(
+    chat_id,
+    text,
+    parse_mode: Optional[str] = "Markdown",
+    reply_markup: Optional[Dict[str, Any]] = None,
+):
     chunk = 4096
     for i in range(0, len(text), chunk):
         part = text[i : i + chunk]
+        kwargs: Dict[str, Any] = {"chat_id": chat_id, "text": part}
+        if parse_mode:
+            kwargs["parse_mode"] = parse_mode
+        if reply_markup is not None and i == 0:
+            kwargs["reply_markup"] = reply_markup
         try:
-            api("sendMessage", chat_id=chat_id, text=part, parse_mode=parse_mode)
+            api("sendMessage", **kwargs)
         except urllib.error.HTTPError as e:
             if e.code == 400 and parse_mode:
-                api("sendMessage", chat_id=chat_id, text=part)
+                plain = {"chat_id": chat_id, "text": part}
+                if reply_markup is not None and i == 0:
+                    plain["reply_markup"] = reply_markup
+                api("sendMessage", **plain)
             else:
                 raise
 
 
-def _multipart_post(url: str, body: bytes, boundary: str, timeout: float = 30):
-    req = urllib.request.Request(url, data=body, method="POST")
-    req.add_header("Content-Type", "multipart/form-data; boundary=%s" % boundary)
-    with proxy.open_url(req, timeout=timeout) as r:
-        return json.loads(r.read().decode())
+def safe_send_message(
+    chat_id: int,
+    text: str,
+    parse_mode: Optional[str] = "Markdown",
+    reply_markup: Optional[Dict[str, Any]] = None,
+) -> bool:
+    if not text:
+        return True
+    for attempt in range(SEND_RETRIES):
+        try:
+            send_message(chat_id, text, parse_mode=parse_mode, reply_markup=reply_markup)
+            dialog_log.log_bot(chat_id, text, ok=True)
+            return True
+        except Exception as e:
+            print(
+                "safe_send_message failed (attempt %s/%s): %s"
+                % (attempt + 1, SEND_RETRIES, e),
+                file=sys.stderr,
+            )
+            if attempt < SEND_RETRIES - 1:
+                time.sleep(SEND_RETRY_DELAY)
+    dialog_log.log_bot(chat_id, text, ok=False, error="send failed after retries")
+    return False
 
 
 def send_photo(chat_id, photo_path: str, caption: Optional[str] = None) -> None:
-    if not os.path.isfile(photo_path):
-        return
-    url = "%s%s/sendPhoto" % (BASE, _TOKEN)
-    with open(photo_path, "rb") as f:
-        photo_data = f.read()
-    boundary = "----FormBoundary" + os.urandom(16).hex()
-    head = (
-        "--%s\r\n"
-        'Content-Disposition: form-data; name="chat_id"\r\n\r\n%s\r\n'
-        "--%s\r\n"
-        'Content-Disposition: form-data; name="photo"; filename="image.png"\r\n'
-        "Content-Type: image/png\r\n\r\n"
-    ) % (boundary, chat_id, boundary)
-    tail = "\r\n--%s--\r\n" % boundary
-    body = head.encode() + photo_data + tail.encode()
+    del caption  # caption not used in streaming queue path
     try:
-        _multipart_post(url, body, boundary)
-    except Exception:
-        pass
+        outbound.send_photo_immediate(proxy.open_url, _TOKEN, chat_id, photo_path)
+    except Exception as e:
+        print("send_photo failed: %s" % e, file=sys.stderr)
 
 
 def send_document(chat_id, file_path: str) -> None:
-    if not os.path.isfile(file_path):
-        return
-    url = "%s%s/sendDocument" % (BASE, _TOKEN)
-    with open(file_path, "rb") as f:
-        file_data = f.read()
-    name = os.path.basename(file_path)
-    boundary = "----FormBoundary" + os.urandom(16).hex()
-    head = (
-        "--%s\r\n"
-        'Content-Disposition: form-data; name="chat_id"\r\n\r\n%s\r\n'
-        "--%s\r\n"
-        'Content-Disposition: form-data; name="document"; filename="%s"\r\n'
-        "Content-Type: application/octet-stream\r\n\r\n"
-    ) % (boundary, chat_id, boundary, name)
-    tail = "\r\n--%s--\r\n" % boundary
-    body = head.encode() + file_data + tail.encode()
     try:
-        _multipart_post(url, body, boundary)
-    except Exception:
-        pass
+        outbound.send_document_immediate(proxy.open_url, _TOKEN, chat_id, file_path)
+    except Exception as e:
+        print("send_document failed: %s" % e, file=sys.stderr)
 
 
-_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp")
+def _flush_outbound(chat_id: int) -> None:
+    outbound.flush_pending(chat_id, send_photo, send_document)
 
 
-def send_pending_images(chat_id) -> None:
-    if not os.path.isdir(PENDING_IMAGES_DIR):
-        return
-    try:
-        for name in sorted(os.listdir(PENDING_IMAGES_DIR)):
-            path = os.path.join(PENDING_IMAGES_DIR, name)
-            if not os.path.isfile(path):
-                continue
-            lower = name.lower()
-            if not any(lower.endswith(ext) for ext in _IMAGE_EXTENSIONS):
-                continue
-            try:
-                send_photo(chat_id, path)
-            except Exception:
-                pass
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
-    except OSError:
-        pass
+def _user_wants_file_delivery(prompt: str) -> bool:
+    return bool(
+        re.search(
+            r"pdf|пришл|отправ|скинь|файл|документ|макет|прилож|attach|download|"
+            r"выгруз|сохран.*в|как будет выглядеть",
+            prompt or "",
+            re.IGNORECASE,
+        )
+    )
 
 
-def send_pending_attachments(chat_id) -> None:
-    if not os.path.isdir(PENDING_ATTACHMENTS_DIR):
-        return
-    try:
-        for name in sorted(os.listdir(PENDING_ATTACHMENTS_DIR)):
-            path = os.path.join(PENDING_ATTACHMENTS_DIR, name)
-            if not os.path.isfile(path):
-                continue
-            lower = name.lower()
-            try:
-                if any(lower.endswith(ext) for ext in _IMAGE_EXTENSIONS):
-                    send_photo(chat_id, path)
-                else:
-                    send_document(chat_id, path)
-            except Exception:
-                pass
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
-    except OSError:
-        pass
+def _delivery_prompt_suffix(prompt: str) -> str:
+    if not _user_wants_file_delivery(prompt):
+        return ""
+    py = os.environ.get("CURSOR_TELEGRAM_PYTHON", "python")
+    attach = os.environ.get("CURSOR_TELEGRAM_ATTACH", "")
+    return (
+        "\n\n(Пользователь ждёт **файл в Telegram**, не путь на диске. "
+        "Обязательно: `\"%s\" \"%s\" --now путь\\к\\файлу` или `[TG_FILE:путь]`. "
+        "Не отвечай только текстом «файл лежит в …».)"
+        % (py, attach)
+    )
+
+
+def _queue_outbound_markers(text: str) -> str:
+    """Extract [TG_FILE:path] markers and auto-attach paths to deliverable files."""
+
+    queued_names: List[str] = []
+    seen_paths: set = set()
+
+    def queue_resolved(resolved: Optional[str]) -> None:
+        if not resolved or resolved in seen_paths:
+            return
+        seen_paths.add(resolved)
+        try:
+            outbound.queue_file(resolved)
+            queued_names.append(os.path.basename(resolved))
+        except (OSError, ValueError) as e:
+            print("outbound queue failed %s: %s" % (resolved, e), file=sys.stderr)
+
+    def repl(match: re.Match) -> str:
+        queue_resolved(outbound.resolve_workspace_path(match.group(1), _WORKSPACE))
+        return ""
+
+    cleaned = TG_FILE_MARKER_RE.sub(repl, text)
+    for path in outbound.extract_sendable_paths(cleaned, _WORKSPACE):
+        queue_resolved(path)
+
+    if queued_names:
+        dialog_log.log_attach(None, queued_names, source="auto_or_marker")
+        note = "📎 " + ", ".join(queued_names)
+        if note not in cleaned:
+            cleaned = cleaned.rstrip() + "\n\n" + note
+    return cleaned
 
 
 def _load_session(mode: str) -> Optional[str]:
@@ -352,7 +405,10 @@ def _parse_session_and_final_output(full_stdout: str, full_stderr: str, returnco
         sid = obj.get("session_id") or obj.get("sessionId") or obj.get("chatId")
         if sid:
             session_id = str(sid)
-        if "result" in obj and isinstance(obj["result"], str):
+        msg_type = (obj.get("type") or "").lower()
+        if msg_type == "result" and isinstance(obj.get("result"), str):
+            response_text = obj["result"].strip()
+        elif "result" in obj and isinstance(obj["result"], str):
             response_text = obj["result"].strip()
         elif response_text is None:
             for key in ("text", "content", "response", "message", "output"):
@@ -398,6 +454,35 @@ def parse_mode_and_text(text: str) -> Tuple[str, str, bool]:
     return cmd, "", False
 
 
+def is_control_message(text: str) -> bool:
+    """True if message is handled immediately (not queued as agent prompt)."""
+    raw = (text or "").strip()
+    if not raw.startswith("/"):
+        return False
+    parts = raw.split()
+    cmd = parts[0].lower()
+    rest = parts[1:]
+
+    if cmd in (
+        "/stop",
+        "/cancel",
+        "/start",
+        "/help",
+        "/keyboard_hide",
+        "/mode",
+        "/sessions",
+        "/newchat",
+    ):
+        return True
+    if cmd == "/session":
+        return True
+    if cmd in ("/reset", "/new", "/use", "/drop", "/delete"):
+        return True
+    if cmd in ("/ask", "/plan", "/agent") and not rest:
+        return True
+    return False
+
+
 def _is_husi_log(name: str) -> bool:
     return fnmatch.fnmatch((name or "").lower(), HUSI_LOG_GLOB.lower())
 
@@ -431,14 +516,24 @@ def run_agent_streaming(
     resume_session: Optional[str],
     chat_id: int,
 ) -> Optional[str]:
+    runtime = get_runtime()
     if not prompt.strip():
-        send_message(chat_id, "(no prompt)")
+        safe_send_message(chat_id, "(no prompt)")
         return resume_session
+
+    dialog_log.log_agent_start(
+        chat_id,
+        mode,
+        prompt,
+        resume_session,
+        named_sessions.get_active_name(),
+    )
 
     cmd = list(_CURSOR_CLI) + [
         "--print",
         "--trust",
         "--force",
+        "--approve-mcps",
         "--workspace",
         _WORKSPACE,
         "--model",
@@ -455,11 +550,15 @@ def run_agent_streaming(
     cmd.append(_wrap_telegram_prompt(prompt, resume_session))
 
     timeout_sec = get_agent_timeout(_CFG)
+    idle_timeout_sec = get_agent_idle_timeout(_CFG)
     full_stdout_lines: List[str] = []
     full_stderr_lines: List[str] = []
     lock = threading.Lock()
     process_done = threading.Event()
     proc_ref: List[Optional[subprocess.Popen]] = [None]
+    last_stdout_at: List[float] = [time.time()]
+    kill_reason: List[Optional[str]] = [None]
+    last_sent_assistant: List[str] = [""]
 
     os.makedirs(LOGS_DIR, exist_ok=True)
     log_name = datetime.now().strftime("%Y-%m-%dT%H-%M-%S") + ".log"
@@ -479,9 +578,13 @@ def run_agent_streaming(
                 env=_agent_subprocess_env(),
             )
             proc_ref[0] = proc
+            runtime.set_process(proc)
             try:
                 with open(log_path, "w", encoding="utf-8") as logf:
                     for line in iter(proc.stdout.readline, ""):
+                        if runtime.stop_requested:
+                            break
+                        last_stdout_at[0] = time.time()
                         with lock:
                             full_stdout_lines.append(line)
                         logf.write(line)
@@ -519,18 +622,31 @@ def run_agent_streaming(
                             )
                         if not isinstance(text, str):
                             continue
-                        to_send = text.strip()
+                        to_send = _queue_outbound_markers(text.strip())
                         if to_send:
-                            send_pending_attachments(chat_id)
-                            send_pending_images(chat_id)
-                            send_message(chat_id, collapse_blank_lines(to_send))
+                            collapsed = collapse_blank_lines(to_send)
+                            dialog_log.log_agent_chunk(chat_id, collapsed)
+                            _flush_outbound(chat_id)
+                            if safe_send_message(chat_id, collapsed):
+                                last_sent_assistant[0] = collapsed
             finally:
                 proc.wait()
                 err = proc.stderr.read() if proc.stderr else ""
                 if err:
                     full_stderr_lines.append(err)
+        except FileNotFoundError as e:
+            missing = getattr(e, "filename", None) or "(unknown)"
+            cli_hint = " ".join(cmd[:6])
+            safe_send_message(
+                chat_id,
+                "Error running agent: %s\n\n"
+                "Не найден: `%s`\n"
+                "CLI: `%s`\n"
+                "Перезапустите: `scripts\\start-background.ps1 -Force`"
+                % (e, missing, cli_hint),
+            )
         except Exception as e:
-            send_message(chat_id, "Error running agent: %s" % e)
+            safe_send_message(chat_id, "Error running agent: %s" % e)
         finally:
             process_done.set()
 
@@ -542,38 +658,102 @@ def run_agent_streaming(
     while not process_done.is_set():
         time.sleep(1)
         now = time.time()
+        if runtime.stop_requested:
+            kill_reason[0] = "Остановлено по /stop."
+            break
         if timeout_sec and (now - start_time) >= timeout_sec:
-            p = proc_ref[0]
-            if p and p.poll() is None:
-                p.kill()
-            send_message(chat_id, "Agent timed out after %s seconds." % timeout_sec)
+            kill_reason[0] = (
+                "Агент остановлен: превышен общий лимит %s с (CURSOR_AGENT_TIMEOUT). "
+                "Повторите запрос или /reset."
+            ) % timeout_sec
+            break
+        if idle_timeout_sec and (now - last_stdout_at[0]) >= idle_timeout_sec:
+            kill_reason[0] = (
+                "Агент остановлен: нет вывода от CLI %s с (зависание, ожидание прав или сеть). "
+                "Долгие задачи с потоком thinking не режутся. Повторите или /reset. "
+                "(CURSOR_AGENT_IDLE_TIMEOUT)"
+            ) % idle_timeout_sec
             break
         if now - last_typing >= TYPING_INTERVAL:
             send_chat_action(chat_id, "typing")
             last_typing = now
 
+    if kill_reason[0]:
+        p = proc_ref[0]
+        if p and p.poll() is None:
+            p.kill()
+        safe_send_message(chat_id, kill_reason[0])
+
     t.join(timeout=10)
+    _flush_outbound(chat_id)
     full_stdout = "".join(full_stdout_lines)
     full_stderr = "".join(full_stderr_lines)
-    _, session_id = _parse_session_and_final_output(full_stdout, full_stderr, 0)
+    returncode = 0
+    if proc_ref[0] is not None:
+        returncode = proc_ref[0].returncode or 0
+    response_text, session_id = _parse_session_and_final_output(
+        full_stdout, full_stderr, returncode
+    )
+    if response_text and response_text != "(no output)":
+        final = collapse_blank_lines(response_text.strip())
+        if final and final != last_sent_assistant[0] and len(final) > len(last_sent_assistant[0]):
+            dialog_log.log_agent_chunk(chat_id, final)
+            to_send = _queue_outbound_markers(final)
+            _flush_outbound(chat_id)
+            safe_send_message(chat_id, to_send or final)
     if not session_id:
         session_id = resume_session
     return session_id
 
 
 def _handle_control(chat_id: int, text: str) -> bool:
-    handled, reply = named_sessions.handle_command(text)
-    if handled:
-        send_message(chat_id, reply or "(ok)")
-        return True
-
     stripped = text.strip()
     lower = stripped.lower()
     parts = stripped.split()
 
+    if lower in ("/stop", "/cancel"):
+        if get_runtime().request_stop():
+            safe_send_message(chat_id, "Останавливаю агента…")
+        else:
+            safe_send_message(chat_id, "Агент не запущен.")
+        return True
+
+    if lower == "/start":
+        safe_send_message(
+            chat_id,
+            telegram_menu.start_message(
+                _WORKSPACE,
+                _DEFAULT_MODE,
+                named_sessions.get_active_name(),
+            ),
+            reply_markup=telegram_menu.reply_keyboard_markup(),
+        )
+        return True
+
+    if lower == "/help":
+        safe_send_message(
+            chat_id,
+            telegram_menu.help_message(_DEFAULT_MODE),
+            reply_markup=telegram_menu.reply_keyboard_markup(),
+        )
+        return True
+
+    if lower == "/keyboard_hide":
+        safe_send_message(
+            chat_id,
+            "Клавиатура скрыта. Вернуть: /start",
+            reply_markup=telegram_menu.reply_keyboard_remove(),
+        )
+        return True
+
+    handled, reply = named_sessions.handle_command(text)
+    if handled:
+        safe_send_message(chat_id, reply or "(ok)")
+        return True
+
     if lower == "/mode":
         active = named_sessions.get_active_name()
-        send_message(
+        safe_send_message(
             chat_id,
             "Default mode: `%s`\nActive named: `%s`\n"
             "Mode sessions: ask=%s, plan=%s, agent=%s\n\n"
@@ -590,7 +770,7 @@ def _handle_control(chat_id: int, text: str) -> bool:
         return True
 
     if lower == "/newchat":
-        send_message(
+        safe_send_message(
             chat_id,
             "Новый контекст:\n"
             "- `/new bugfix` — именованная сессия (create-chat)\n"
@@ -604,7 +784,7 @@ def _handle_control(chat_id: int, text: str) -> bool:
             for mode in ("ask", "plan", "agent"):
                 _save_session(mode, None)
             named_sessions.clear_active()
-            send_message(
+            safe_send_message(
                 chat_id,
                 "Сброшено: ask/plan/agent sessions + active именованная.\n"
                 "Именованные записи в `/sessions` сохранены (id остались). "
@@ -614,22 +794,190 @@ def _handle_control(chat_id: int, text: str) -> bool:
         target = parts[1].lower()
         if target in ("ask", "plan", "agent"):
             _save_session(target, None)
-            send_message(chat_id, "Session `%s` cleared." % target)
+            safe_send_message(chat_id, "Session `%s` cleared." % target)
             return True
         if target == "all":
             for mode in ("ask", "plan", "agent"):
                 _save_session(mode, None)
             named_sessions.clear_active()
-            send_message(chat_id, "Mode sessions + active cleared.")
+            safe_send_message(chat_id, "Mode sessions + active cleared.")
             return True
         try:
             named_sessions.drop_named(parts[1])
-            send_message(chat_id, "Именованная сессия `%s` удалена." % parts[1])
+            safe_send_message(chat_id, "Именованная сессия `%s` удалена." % parts[1])
         except ValueError as e:
-            send_message(chat_id, str(e))
+            safe_send_message(chat_id, str(e))
         return True
 
     return False
+
+
+def _agent_job(chat_id: int, text: str, mode: str, resume: Optional[str]) -> None:
+    session_id = run_agent_streaming(text, mode, resume, chat_id)
+    if named_sessions.get_active_name():
+        named_sessions.update_active_session_id(session_id)
+    else:
+        _save_session(mode, session_id)
+
+
+def _process_updates(updates: List[dict]) -> int:
+    batch_texts: List[str] = []
+    batch_image_paths: List[str] = []
+    batch_document_paths: List[Tuple[str, str]] = []
+    chat_id = None
+    force_ask = False
+    husi_caption = ""
+
+    for i, upd in enumerate(updates):
+        msg = upd.get("message") or upd.get("edited_message")
+        if not msg:
+            continue
+        uid = (msg.get("from") or {}).get("id")
+        if uid != _ALLOWED_USER_ID:
+            continue
+        if chat_id is None:
+            chat_id = msg["chat"]["id"]
+        text = (msg.get("text") or "").strip()
+        if text:
+            if is_control_message(text):
+                dialog_log.log_user(chat_id, text, control=True)
+            if _handle_control(chat_id, text):
+                continue
+            if get_runtime().is_busy():
+                safe_send_message(
+                    chat_id,
+                    "Агент занят. Дождитесь ответа или отправьте /stop.",
+                )
+                continue
+            dialog_log.log_user(chat_id, text)
+            batch_texts.append(text)
+
+        photos = msg.get("photo") or []
+        if photos:
+            if get_runtime().is_busy():
+                safe_send_message(
+                    chat_id,
+                    "Агент занят. Дождитесь ответа или отправьте /stop.",
+                )
+                continue
+            file_id = photos[-1].get("file_id")
+            if file_id:
+                os.makedirs(RECEIVED_IMAGES_DIR, exist_ok=True)
+                local_name = "photo_%s_%s.jpg" % (upd["update_id"], i)
+                dest_path = os.path.join(RECEIVED_IMAGES_DIR, local_name)
+                if download_telegram_file(file_id, dest_path):
+                    batch_image_paths.append(dest_path)
+            caption = (msg.get("caption") or "").strip()
+            if caption:
+                if is_control_message(caption) or _handle_control(chat_id, caption):
+                    continue
+                if get_runtime().is_busy():
+                    safe_send_message(
+                        chat_id,
+                        "Агент занят. Дождитесь ответа или отправьте /stop.",
+                    )
+                    continue
+                batch_texts.append(caption)
+
+        doc = msg.get("document")
+        if isinstance(doc, dict) and doc.get("file_id"):
+            if get_runtime().is_busy():
+                safe_send_message(
+                    chat_id,
+                    "Агент занят. Дождитесь ответа или отправьте /stop.",
+                )
+                continue
+            os.makedirs(RECEIVED_DOCUMENTS_DIR, exist_ok=True)
+            orig_name = doc.get("file_name") or "file"
+            safe = _safe_document_filename(orig_name)
+            local_name = "doc_%s_%s_%s" % (upd["update_id"], i, safe)
+            dest_path = os.path.join(RECEIVED_DOCUMENTS_DIR, local_name)
+            if download_telegram_file(doc["file_id"], dest_path):
+                if _is_husi_log(orig_name):
+                    ws_path = _copy_husi_log_to_workspace(dest_path, orig_name)
+                    batch_document_paths.append((ws_path, orig_name))
+                    force_ask = True
+                    husi_caption = (msg.get("caption") or "").strip()
+                else:
+                    batch_document_paths.append((dest_path, orig_name))
+            elif chat_id is not None:
+                safe_send_message(
+                    chat_id,
+                    "Не удалось скачать файл `%s` с серверов Telegram "
+                    "(прокси/сеть). Перешлите ещё раз или отправьте как **файл** "
+                    "с подписью-вопросом." % safe,
+                )
+            cap = (msg.get("caption") or "").strip()
+            if cap and not _is_husi_log(orig_name):
+                batch_texts.append(cap)
+
+    new_offset = updates[-1]["update_id"] + 1
+    save_offset(new_offset)
+
+    if not batch_texts and not batch_image_paths and not batch_document_paths:
+        return new_offset
+    if chat_id is None:
+        return new_offset
+    save_chat_id(chat_id)
+
+    if get_runtime().is_busy():
+        safe_send_message(
+            chat_id,
+            "Агент занят. Дождитесь ответа или отправьте /stop.",
+        )
+        return new_offset
+
+    mode = _DEFAULT_MODE
+    prompt_parts: List[str] = []
+    for t in batch_texts:
+        m, body, _ = parse_mode_and_text(t)
+        if body:
+            mode = m
+            prompt_parts.append(body)
+        elif m != _DEFAULT_MODE:
+            mode = m
+
+    if force_ask:
+        mode = "ask"
+
+    text = "\n\n".join(prompt_parts) if prompt_parts else ""
+
+    if batch_image_paths:
+        text += "\n\n[User sent %d image(s) at: %s]" % (
+            len(batch_image_paths),
+            ", ".join(batch_image_paths),
+        )
+    if batch_document_paths:
+        paths = [p for p, _ in batch_document_paths]
+        if force_ask and batch_document_paths:
+            ws_path = batch_document_paths[0][0]
+            text = _load_log_triage_prompt(husi_caption, ws_path) + "\n\n" + text
+        else:
+            text += "\n\n[User sent %d file(s) at: %s. Read and respond.]" % (
+                len(paths),
+                ", ".join(paths),
+            )
+
+    if not text.strip():
+        return new_offset
+
+    print(
+        "Running agent mode=%s active=%s prompt: %s..."
+        % (mode, named_sessions.get_active_name() or "-", text[:60]),
+        file=sys.stderr,
+    )
+    send_chat_action(chat_id, "typing")
+    resume = named_sessions.get_active_session_id()
+    if not resume:
+        resume = _MODE_SESSIONS.get(mode)
+
+    if not get_runtime().start_job(_agent_job, chat_id, text, mode, resume):
+        safe_send_message(
+            chat_id,
+            "Агент уже запущен. Дождитесь ответа или /stop.",
+        )
+
+    return new_offset
 
 
 def main():
@@ -651,6 +999,10 @@ def main():
             print("API error: %s" % e, file=sys.stderr)
             time.sleep(5)
             continue
+        except Exception as e:
+            print("getUpdates error: %s" % e, file=sys.stderr)
+            time.sleep(5)
+            continue
         if not out.get("ok"):
             print("API not ok: %s" % out, file=sys.stderr)
             time.sleep(5)
@@ -658,118 +1010,14 @@ def main():
         updates = out.get("result", [])
         if not updates:
             continue
+        try:
+            offset = _process_updates(updates)
+        except Exception as e:
+            print("process updates error: %s" % e, file=sys.stderr)
+            import traceback
 
-        batch_texts: List[str] = []
-        batch_image_paths: List[str] = []
-        batch_document_paths: List[Tuple[str, str]] = []
-        chat_id = None
-        force_ask = False
-        husi_caption = ""
-
-        for i, upd in enumerate(updates):
-            msg = upd.get("message") or upd.get("edited_message")
-            if not msg:
-                continue
-            uid = (msg.get("from") or {}).get("id")
-            if uid != _ALLOWED_USER_ID:
-                continue
-            if chat_id is None:
-                chat_id = msg["chat"]["id"]
-            text = (msg.get("text") or "").strip()
-            if text:
-                if _handle_control(chat_id, text):
-                    continue
-                batch_texts.append(text)
-
-            photos = msg.get("photo") or []
-            if photos:
-                file_id = photos[-1].get("file_id")
-                if file_id:
-                    os.makedirs(RECEIVED_IMAGES_DIR, exist_ok=True)
-                    local_name = "photo_%s_%s.jpg" % (upd["update_id"], i)
-                    dest_path = os.path.join(RECEIVED_IMAGES_DIR, local_name)
-                    if download_telegram_file(file_id, dest_path):
-                        batch_image_paths.append(dest_path)
-                caption = (msg.get("caption") or "").strip()
-                if caption:
-                    batch_texts.append(caption)
-
-            doc = msg.get("document")
-            if isinstance(doc, dict) and doc.get("file_id"):
-                os.makedirs(RECEIVED_DOCUMENTS_DIR, exist_ok=True)
-                orig_name = doc.get("file_name") or "file"
-                safe = _safe_document_filename(orig_name)
-                local_name = "doc_%s_%s_%s" % (upd["update_id"], i, safe)
-                dest_path = os.path.join(RECEIVED_DOCUMENTS_DIR, local_name)
-                if download_telegram_file(doc["file_id"], dest_path):
-                    if _is_husi_log(orig_name):
-                        ws_path = _copy_husi_log_to_workspace(dest_path, orig_name)
-                        batch_document_paths.append((ws_path, orig_name))
-                        force_ask = True
-                        husi_caption = (msg.get("caption") or "").strip()
-                    else:
-                        batch_document_paths.append((dest_path, orig_name))
-                cap = (msg.get("caption") or "").strip()
-                if cap and not _is_husi_log(orig_name):
-                    batch_texts.append(cap)
-
-        offset = updates[-1]["update_id"] + 1
-        save_offset(offset)
-
-        if not batch_texts and not batch_image_paths and not batch_document_paths:
-            continue
-        if chat_id is None:
-            continue
-        save_chat_id(chat_id)
-
-        mode = _DEFAULT_MODE
-        prompt_parts: List[str] = []
-        for t in batch_texts:
-            m, body, _ = parse_mode_and_text(t)
-            if body:
-                mode = m
-                prompt_parts.append(body)
-            elif m != _DEFAULT_MODE:
-                mode = m
-
-        if force_ask:
-            mode = "ask"
-
-        text = "\n\n".join(prompt_parts) if prompt_parts else ""
-
-        if batch_image_paths:
-            text += "\n\n[User sent %d image(s) at: %s]" % (
-                len(batch_image_paths),
-                ", ".join(batch_image_paths),
-            )
-        if batch_document_paths:
-            paths = [p for p, _ in batch_document_paths]
-            if force_ask and batch_document_paths:
-                ws_path = batch_document_paths[0][0]
-                text = _load_log_triage_prompt(husi_caption, ws_path) + "\n\n" + text
-            else:
-                text += "\n\n[User sent %d file(s) at: %s. Read and respond.]" % (
-                    len(paths),
-                    ", ".join(paths),
-                )
-
-        if not text.strip():
-            continue
-
-        print("Running agent mode=%s active=%s prompt: %s..." % (
-            mode,
-            named_sessions.get_active_name() or "-",
-            text[:60],
-        ), file=sys.stderr)
-        send_chat_action(chat_id, "typing")
-        resume = named_sessions.get_active_session_id()
-        if not resume:
-            resume = _MODE_SESSIONS.get(mode)
-        session_id = run_agent_streaming(text, mode, resume, chat_id)
-        if named_sessions.get_active_name():
-            named_sessions.update_active_session_id(session_id)
-        else:
-            _save_session(mode, session_id)
+            traceback.print_exc(file=sys.stderr)
+            time.sleep(2)
 
 
 if __name__ == "__main__":

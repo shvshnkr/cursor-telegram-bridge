@@ -14,6 +14,7 @@ telegram-bot/.cursor_agent_session*
 telegram-bot/named_sessions.json
 telegram-bot/chat_id
 telegram-bot/.telegram_offset
+telegram-bot/.bot.pid
 telegram-bot/reminders.json
 
 # Received media and logs (may contain private chats)
@@ -22,6 +23,9 @@ telegram-bot/received_documents/
 telegram-bot/logs/
 telegram-bot/pending_images/
 telegram-bot/pending_attachments/
+
+# Accidental Windows cache paths (bad env expansion)
+telegram-bot/%SystemDrive%/
 
 # Python / venv
 __pycache__/

@@ -128,6 +128,7 @@ def session_help_text() -> str:
         "- `/drop all` — удалить все именованные\n"
         "- `/reset` — сброс ask/plan/agent + снять active\n"
         "- `/reset ask|plan|agent` — сброс одного mode\n"
+        "- `/stop` — прервать текущий запуск агента\n"
         "\nБез active — как раньше: отдельный контекст на `/ask`, `/plan`, `/agent`."
     )
 

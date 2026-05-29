@@ -13,12 +13,15 @@ CONFIG_FILE = os.path.join(SCRIPT_DIR, "config")
 
 DEFAULTS: Dict[str, str] = {
     "CURSOR_AGENT_TIMEOUT": "0",
+    "CURSOR_AGENT_IDLE_TIMEOUT": "1200",
     "CURSOR_AGENT_MODE": "agent",
     "CURSOR_AGENT_MODEL": "Auto",
     "CURSOR_AGENT_LANGUAGE": "ru",
     "CURSOR_WORKSPACE": "",
     "CURSOR_CLI": "",
     "PROXY_SOCKS5_URLS": "",
+    "TELEGRAM_DIALOG_LOG": "0",
+    "TELEGRAM_DIALOG_LOG_DIR": "",
 }
 
 
@@ -71,13 +74,26 @@ def require_telegram(cfg: Dict[str, str]) -> Tuple[str, int]:
     return token, user_id
 
 
-def get_agent_timeout(cfg: Dict[str, str]) -> int:
-    raw = cfg.get("CURSOR_AGENT_TIMEOUT", "0").strip() or "0"
+def _parse_timeout_seconds(cfg: Dict[str, str], key: str, default: str = "0") -> int:
+    raw = (cfg.get(key) or default).strip() or default
     try:
         timeout = int(raw)
     except ValueError:
         timeout = 0
     return timeout if timeout > 0 else 0
+
+
+def get_agent_timeout(cfg: Dict[str, str]) -> int:
+    """Wall-clock limit for one agent subprocess; 0 = unlimited."""
+    return _parse_timeout_seconds(cfg, "CURSOR_AGENT_TIMEOUT", "0")
+
+
+def get_agent_idle_timeout(cfg: Dict[str, str]) -> int:
+    """
+    Stop agent if no stdout from CLI for this many seconds (thinking/stream-json counts).
+    0 = disabled. Default 1200 — long log runs can take many minutes if CLI keeps streaming.
+    """
+    return _parse_timeout_seconds(cfg, "CURSOR_AGENT_IDLE_TIMEOUT", "1200")
 
 
 def get_workspace(cfg: Dict[str, str]) -> str:
@@ -103,15 +119,56 @@ def get_agent_language(cfg: Dict[str, str]) -> str:
     return (cfg.get("CURSOR_AGENT_LANGUAGE") or "ru").strip().lower() or "ru"
 
 
+def get_dialog_log_enabled(cfg: Dict[str, str]) -> bool:
+    raw = (cfg.get("TELEGRAM_DIALOG_LOG") or "0").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def get_dialog_log_dir(cfg: Dict[str, str]) -> str:
+    custom = (cfg.get("TELEGRAM_DIALOG_LOG_DIR") or "").strip()
+    if custom:
+        return os.path.abspath(os.path.expanduser(custom))
+    return os.path.join(SCRIPT_DIR, "logs")
+
+
 def session_file_for_mode(mode: str) -> str:
     safe = mode if mode in ("ask", "plan", "agent") else "agent"
     return os.path.join(SCRIPT_DIR, ".cursor_agent_session.%s" % safe)
 
 
+def _cursor_agent_cmd_candidates() -> List[str]:
+    """Well-known install locations when agent is not on PATH (common for background tasks)."""
+    out: List[str] = []
+    local = os.environ.get("LOCALAPPDATA", "")
+    if local:
+        out.append(os.path.join(local, "cursor-agent", "agent.cmd"))
+    roaming = os.environ.get("APPDATA", "")
+    if roaming:
+        out.append(os.path.join(roaming, "cursor-agent", "agent.cmd"))
+    home = os.path.expanduser("~")
+    if home:
+        out.append(os.path.join(home, ".cursor", "bin", "agent.cmd"))
+    return out
+
+
+def _windows_system32(exe_name: str) -> str:
+    root = os.environ.get("SystemRoot", r"C:\Windows")
+    return os.path.join(root, "System32", exe_name)
+
+
+def _resolve_cursor_agent_ps1(cmd_path: str) -> Optional[str]:
+    """cursor-agent installs agent.cmd next to cursor-agent.ps1 — prefer direct PS1 launch."""
+    if not cmd_path.lower().endswith((".cmd", ".bat")):
+        return None
+    script_dir = os.path.dirname(os.path.abspath(cmd_path))
+    ps1 = os.path.join(script_dir, "cursor-agent.ps1")
+    return ps1 if os.path.isfile(ps1) else None
+
+
 def resolve_cli_argv(argv: List[str]) -> List[str]:
     """
     Resolve CLI executable to a path subprocess can spawn on Windows.
-    .cmd/.bat wrappers (Cursor agent installer) need cmd.exe /c.
+    Background tasks often lack PATH — use full paths to cmd/powershell, or PS1 directly.
     """
     if not argv:
         return argv
@@ -125,33 +182,76 @@ def resolve_cli_argv(argv: List[str]) -> List[str]:
             or shutil.which(exe + ".exe")
             or exe
         )
+    rest = argv[1:]
     if os.name == "nt" and resolved.lower().endswith((".cmd", ".bat")):
-        return ["cmd.exe", "/c", resolved] + argv[1:]
-    if resolved != exe:
-        return [resolved] + argv[1:]
+        ps1 = _resolve_cursor_agent_ps1(resolved)
+        if ps1:
+            pwsh = _windows_system32(
+                os.path.join("WindowsPowerShell", "v1.0", "powershell.exe")
+            )
+            if os.path.isfile(pwsh):
+                return [
+                    pwsh,
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    ps1,
+                ] + rest
+        cmd_exe = _windows_system32("cmd.exe")
+        if os.path.isfile(cmd_exe):
+            return [cmd_exe, "/c", os.path.abspath(resolved)] + rest
+        return ["cmd.exe", "/c", resolved] + rest
+    if resolved != exe and os.path.isfile(resolved):
+        return [resolved] + rest
     return argv
+
+
+def _probe_cli_argv(argv: List[str]) -> bool:
+    try:
+        subprocess.run(
+            argv + ["--version"],
+            capture_output=True,
+            timeout=15,
+            check=False,
+        )
+        return True
+    except (OSError, subprocess.TimeoutExpired):
+        return False
 
 
 def detect_cursor_cli(preferred: str = "") -> List[str]:
     """Return argv prefix for Cursor CLI, e.g. cmd.exe /c agent.cmd or ['cursor', 'agent']."""
     pref = (preferred or "").strip()
+    # Bare "agent" in config should not skip full-path discovery (background tasks often lack PATH).
+    if pref.lower() in ("agent", "agent.cmd", "cursor agent"):
+        pref = ""
     if pref:
-        return resolve_cli_argv(pref.split())
+        argv = resolve_cli_argv(pref.split())
+        if _probe_cli_argv(argv):
+            return argv
+        # Config path invalid — fall back to discovery below.
+
+    for candidate in _cursor_agent_cmd_candidates():
+        if os.path.isfile(candidate):
+            argv = resolve_cli_argv([candidate])
+            if _probe_cli_argv(argv):
+                return argv
+
     agent_path = shutil.which("agent") or shutil.which("agent.cmd")
     if agent_path:
         argv = resolve_cli_argv(["agent"])
-        try:
-            subprocess.run(
-                argv + ["--version"],
-                capture_output=True,
-                timeout=15,
-                check=False,
-            )
+        if _probe_cli_argv(argv):
             return argv
-        except (OSError, subprocess.TimeoutExpired):
-            pass
+
     if shutil.which("cursor"):
-        return ["cursor", "agent"]
+        argv = ["cursor", "agent"]
+        if _probe_cli_argv(argv):
+            return argv
+
+    for candidate in _cursor_agent_cmd_candidates():
+        if os.path.isfile(candidate):
+            return resolve_cli_argv([candidate])
     return resolve_cli_argv(["agent"])
 
 
