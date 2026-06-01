@@ -63,18 +63,30 @@ def _check_file(path: str) -> None:
 
 
 def queue_file(src_path: str) -> str:
-    """Copy a file into the pending queue; bot sends it with the next reply chunk."""
+    """Copy a file into the pending queue; one stable name per basename (no duplicate sends)."""
     src = os.path.abspath(src_path)
     _check_file(src)
     dest_dir = PENDING_IMAGES_DIR if is_image_path(src) else PENDING_ATTACHMENTS_DIR
     os.makedirs(dest_dir, mode=0o700, exist_ok=True)
-    base = os.path.basename(src)
-    name, ext = os.path.splitext(base)
-    stamp = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
-    dest_name = "%s_%s%s" % (name, stamp, ext)
-    dest = os.path.join(dest_dir, dest_name)
+    dest = os.path.join(dest_dir, os.path.basename(src))
+    if os.path.isfile(dest) and os.path.getsize(dest) == os.path.getsize(src):
+        return dest
     shutil.copy2(src, dest)
     return dest
+
+
+def clear_pending() -> None:
+    """Remove queued attachments (call at start of each agent run)."""
+    for directory in (PENDING_IMAGES_DIR, PENDING_ATTACHMENTS_DIR):
+        if not os.path.isdir(directory):
+            continue
+        try:
+            for name in os.listdir(directory):
+                path = os.path.join(directory, name)
+                if os.path.isfile(path):
+                    os.unlink(path)
+        except OSError as e:
+            print("clear_pending failed %s: %s" % (directory, e), file=sys.stderr)
 
 
 def flush_pending(

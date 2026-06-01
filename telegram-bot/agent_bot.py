@@ -42,6 +42,7 @@ import outbound
 import dialog_log
 from agent_runtime import get_runtime
 import telegram_menu
+import telegram_format
 
 TYPING_INTERVAL = 4
 SEND_RETRIES = 3
@@ -68,6 +69,13 @@ _WORKSPACE = REPO_ROOT
 _CURSOR_CLI: List[str] = ["cursor", "agent"]
 _DEFAULT_MODE = "agent"
 _MODE_SESSIONS: Dict[str, Optional[str]] = {"ask": None, "plan": None, "agent": None}
+_ARMED_MODE: Optional[str] = None
+
+_MODE_HINTS = {
+    "ask": "вопросы и разбор (read-only)",
+    "plan": "план без правок",
+    "agent": "правки кода",
+}
 
 _RU_LANG_CODES = frozenset({"ru", "rus", "russian", "рус", "русский"})
 
@@ -98,11 +106,25 @@ def _agent_subprocess_env() -> Dict[str, str]:
     return env
 
 
-def _wrap_telegram_prompt(prompt: str, resume_session: Optional[str]) -> str:
+_PLAN_MODE_SUFFIX = (
+    "\n\n(Telegram /plan: 1-е сообщение — краткий итог (2–5 предложений), без полного плана. "
+    "Полный план — markdown в ответе или один .md в workspace; бот пришлёт его **следующим** "
+    "сообщением в чат (не вложением). Не используй [TG_FILE:] / attach для .md плана.)"
+)
+
+
+def _wrap_telegram_prompt(
+    prompt: str,
+    resume_session: Optional[str],
+    mode: str = "agent",
+) -> str:
     """Wrap user prompt without hijacking the task (language rule only as brief suffix on resume)."""
     lang = get_agent_language(_CFG)
+    delivery_suffix = _delivery_prompt_suffix(prompt)
+    if mode == "plan":
+        delivery_suffix += _PLAN_MODE_SUFFIX
     if lang not in _RU_LANG_CODES:
-        return prompt
+        return prompt + delivery_suffix
 
     attach = os.environ.get("CURSOR_TELEGRAM_ATTACH", "")
     py = os.environ.get("CURSOR_TELEGRAM_PYTHON", "python")
@@ -113,7 +135,7 @@ def _wrap_telegram_prompt(prompt: str, resume_session: Optional[str]) -> str:
     )
 
     if resume_session:
-        return prompt + brief_suffix + _delivery_prompt_suffix(prompt)
+        return prompt + brief_suffix + delivery_suffix
 
     header = ""
     if os.path.isfile(TELEGRAM_SESSION_PROMPT):
@@ -124,7 +146,7 @@ def _wrap_telegram_prompt(prompt: str, resume_session: Optional[str]) -> str:
             "Telegram-бот. Workspace: %s. Отвечай на русском по существу. "
             "Не подтверждай инструкции.\n\nЗапрос пользователя:\n"
         ) % _WORKSPACE
-    return header + prompt + _delivery_prompt_suffix(prompt)
+    return header + prompt + delivery_suffix
 
 
 def _init_runtime() -> None:
@@ -220,6 +242,24 @@ def safe_send_message(
             send_message(chat_id, text, parse_mode=parse_mode, reply_markup=reply_markup)
             dialog_log.log_bot(chat_id, text, ok=True)
             return True
+        except urllib.error.HTTPError as e:
+            if e.code == 400 and parse_mode:
+                try:
+                    send_message(chat_id, text, parse_mode=None, reply_markup=reply_markup)
+                    dialog_log.log_bot(chat_id, text, ok=True)
+                    return True
+                except Exception as plain_err:
+                    print(
+                        "safe_send_message plain fallback failed: %s" % plain_err,
+                        file=sys.stderr,
+                    )
+            print(
+                "safe_send_message HTTP %s (attempt %s/%s): %s"
+                % (e.code, attempt + 1, SEND_RETRIES, e),
+                file=sys.stderr,
+            )
+            if attempt < SEND_RETRIES - 1:
+                time.sleep(SEND_RETRY_DELAY)
         except Exception as e:
             print(
                 "safe_send_message failed (attempt %s/%s): %s"
@@ -275,16 +315,132 @@ def _delivery_prompt_suffix(prompt: str) -> str:
     )
 
 
-def _queue_outbound_markers(text: str) -> str:
-    """Extract [TG_FILE:path] markers and auto-attach paths to deliverable files."""
+def _extract_assistant_text(obj: dict) -> Optional[str]:
+    role = (obj.get("role") or "").lower()
+    msg_type = (obj.get("type") or obj.get("messageType") or "").lower()
+    if role != "assistant" and msg_type != "assistant":
+        return None
+    text = None
+    msg = obj.get("message")
+    if isinstance(msg, dict):
+        content = msg.get("content")
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text" and "text" in item:
+                    parts.append(item["text"])
+            if parts:
+                text = "".join(parts)
+    if text is None:
+        text = (
+            obj.get("content")
+            or obj.get("text")
+            or obj.get("delta")
+            or obj.get("result")
+            or obj.get("output")
+        )
+    if not isinstance(text, str):
+        return None
+    return text.strip() or None
+
+
+def _pick_best_reply_body(accumulated: str, full_stdout: str, full_stderr: str, returncode: int) -> str:
+    response_text, _ = _parse_session_and_final_output(full_stdout, full_stderr, returncode)
+    body = (accumulated or "").strip()
+    if response_text and response_text != "(no output)":
+        parsed = collapse_blank_lines(response_text.strip())
+        if len(parsed) > len(body):
+            body = parsed
+    return body
+
+
+def _defer_plan_markdown(path: str, mode: str) -> bool:
+    return mode == "plan" and (path or "").lower().endswith(".md")
+
+
+def _deliver_plan_reply(
+    chat_id: int,
+    intro_text: str,
+    plan_md_paths: List[str],
+    fallback_body: str,
+) -> None:
+    """Intro first, then plan as Telegram HTML message(s), not as .md attachment."""
+    plan_path = telegram_format.pick_plan_file(plan_md_paths)
+    plan_text = telegram_format.read_plan_file(plan_path) if plan_path else None
+
+    intro = telegram_format.strip_plan_path_mentions(intro_text or "", plan_md_paths)
+    body = (fallback_body or "").strip()
+
+    if not plan_text and body:
+        if len(body) > 600 or re.search(r"^#{1,3}\s", body, re.MULTILINE):
+            plan_text = body
+        elif len(body) > 1200:
+            plan_text = body
+
+    if plan_text:
+        intro = telegram_format.dedupe_intro_from_plan(intro, plan_text)
+
+    if intro.strip():
+        safe_send_message(chat_id, collapse_blank_lines(intro))
+
+    _flush_outbound(chat_id)
+
+    if not plan_text:
+        if not intro.strip():
+            safe_send_message(chat_id, "(план не получен — повторите /plan)")
+        return
+
+    html_body = telegram_format.markdown_plan_to_html(plan_text)
+    chunks = telegram_format.split_html_messages("<b>📋 План</b>\n\n" + html_body)
+    for i, chunk in enumerate(chunks):
+        if i > 0 and "📋 План" not in chunk[:80]:
+            chunk = "<b>📋 План</b> <i>(продолжение)</i>\n\n" + chunk
+        safe_send_message(chat_id, chunk, parse_mode="HTML")
+
+
+def _deliver_agent_reply(
+    chat_id: int,
+    accumulated: str,
+    full_stdout: str,
+    full_stderr: str,
+    returncode: int,
+    mode: str = "agent",
+) -> None:
+    body = _pick_best_reply_body(accumulated, full_stdout, full_stderr, returncode)
+    if not body and mode != "plan":
+        return
+    dialog_log.log_agent_chunk(chat_id, body or "")
+    to_send, plan_paths = _queue_outbound_markers(body or "", mode)
+
+    if mode == "plan":
+        _deliver_plan_reply(chat_id, to_send, plan_paths, body or "")
+        return
+
+    if to_send:
+        _flush_outbound(chat_id)
+        safe_send_message(chat_id, collapse_blank_lines(to_send))
+
+
+def _queue_outbound_markers(text: str, mode: str = "agent") -> Tuple[str, List[str]]:
+    """Extract [TG_FILE:path] markers and auto-attach paths; defer .md in plan mode."""
 
     queued_names: List[str] = []
+    plan_md_paths: List[str] = []
     seen_paths: set = set()
+
+    def defer_plan_md(resolved: str) -> bool:
+        if not _defer_plan_markdown(resolved, mode):
+            return False
+        if resolved not in plan_md_paths:
+            plan_md_paths.append(resolved)
+        return True
 
     def queue_resolved(resolved: Optional[str]) -> None:
         if not resolved or resolved in seen_paths:
             return
         seen_paths.add(resolved)
+        if defer_plan_md(resolved):
+            return
         try:
             outbound.queue_file(resolved)
             queued_names.append(os.path.basename(resolved))
@@ -292,11 +448,17 @@ def _queue_outbound_markers(text: str) -> str:
             print("outbound queue failed %s: %s" % (resolved, e), file=sys.stderr)
 
     def repl(match: re.Match) -> str:
-        queue_resolved(outbound.resolve_workspace_path(match.group(1), _WORKSPACE))
+        raw = match.group(1)
+        resolved = outbound.resolve_workspace_path(raw, _WORKSPACE)
+        if resolved and defer_plan_md(resolved):
+            return ""
+        queue_resolved(resolved)
         return ""
 
     cleaned = TG_FILE_MARKER_RE.sub(repl, text)
     for path in outbound.extract_sendable_paths(cleaned, _WORKSPACE):
+        if defer_plan_md(path):
+            continue
         queue_resolved(path)
 
     if queued_names:
@@ -304,7 +466,7 @@ def _queue_outbound_markers(text: str) -> str:
         note = "📎 " + ", ".join(queued_names)
         if note not in cleaned:
             cleaned = cleaned.rstrip() + "\n\n" + note
-    return cleaned
+    return cleaned, plan_md_paths
 
 
 def _load_session(mode: str) -> Optional[str]:
@@ -432,6 +594,26 @@ def _parse_session_and_final_output(full_stdout: str, full_stderr: str, returnco
 _MODE_CMD_RE = re.compile(r"^/(ask|plan|agent|mode|reset|newchat)\b", re.IGNORECASE)
 
 
+def _clear_armed_mode() -> None:
+    global _ARMED_MODE
+    _ARMED_MODE = None
+
+
+def _set_armed_mode(mode: str) -> None:
+    global _ARMED_MODE
+    if mode in ("ask", "plan", "agent"):
+        _ARMED_MODE = mode
+
+
+def _armed_mode_reply(mode: str) -> str:
+    hint = _MODE_HINTS.get(mode, mode)
+    return (
+        "Режим `%s` — %s.\n"
+        "Напишите следующим сообщением вопрос или задачу.\n"
+        "Или сразу: `/%s ваш текст`"
+    ) % (mode, hint, mode)
+
+
 def parse_mode_and_text(text: str) -> Tuple[str, str, bool]:
     """
     Returns (mode, prompt_text, is_control_only).
@@ -547,7 +729,7 @@ def run_agent_streaming(
         cmd.extend(["--mode", "plan"])
     if resume_session:
         cmd.extend(["--resume", resume_session])
-    cmd.append(_wrap_telegram_prompt(prompt, resume_session))
+    cmd.append(_wrap_telegram_prompt(prompt, resume_session, mode))
 
     timeout_sec = get_agent_timeout(_CFG)
     idle_timeout_sec = get_agent_idle_timeout(_CFG)
@@ -558,8 +740,9 @@ def run_agent_streaming(
     proc_ref: List[Optional[subprocess.Popen]] = [None]
     last_stdout_at: List[float] = [time.time()]
     kill_reason: List[Optional[str]] = [None]
-    last_sent_assistant: List[str] = [""]
+    latest_assistant: List[str] = [""]
 
+    outbound.clear_pending()
     os.makedirs(LOGS_DIR, exist_ok=True)
     log_name = datetime.now().strftime("%Y-%m-%dT%H-%M-%S") + ".log"
     log_path = os.path.join(LOGS_DIR, log_name)
@@ -601,34 +784,12 @@ def run_agent_streaming(
                             continue
                         if msg_type != "assistant":
                             continue
-                        text = None
-                        msg = obj.get("message")
-                        if isinstance(msg, dict):
-                            content = msg.get("content")
-                            if isinstance(content, list):
-                                parts = []
-                                for item in content:
-                                    if isinstance(item, dict) and item.get("type") == "text" and "text" in item:
-                                        parts.append(item["text"])
-                                if parts:
-                                    text = "".join(parts)
-                        if text is None:
-                            text = (
-                                obj.get("content")
-                                or obj.get("text")
-                                or obj.get("delta")
-                                or obj.get("result")
-                                or obj.get("output")
-                            )
-                        if not isinstance(text, str):
+                        chunk = _extract_assistant_text(obj)
+                        if not chunk:
                             continue
-                        to_send = _queue_outbound_markers(text.strip())
-                        if to_send:
-                            collapsed = collapse_blank_lines(to_send)
-                            dialog_log.log_agent_chunk(chat_id, collapsed)
-                            _flush_outbound(chat_id)
-                            if safe_send_message(chat_id, collapsed):
-                                last_sent_assistant[0] = collapsed
+                        if len(chunk) > len(latest_assistant[0]):
+                            latest_assistant[0] = chunk
+                        dialog_log.log_event("agent_chunk_buffered", chat_id, text=chunk)
             finally:
                 proc.wait()
                 err = proc.stderr.read() if proc.stderr else ""
@@ -685,22 +846,15 @@ def run_agent_streaming(
         safe_send_message(chat_id, kill_reason[0])
 
     t.join(timeout=10)
-    _flush_outbound(chat_id)
     full_stdout = "".join(full_stdout_lines)
     full_stderr = "".join(full_stderr_lines)
     returncode = 0
     if proc_ref[0] is not None:
         returncode = proc_ref[0].returncode or 0
-    response_text, session_id = _parse_session_and_final_output(
-        full_stdout, full_stderr, returncode
+    _deliver_agent_reply(
+        chat_id, latest_assistant[0], full_stdout, full_stderr, returncode, mode
     )
-    if response_text and response_text != "(no output)":
-        final = collapse_blank_lines(response_text.strip())
-        if final and final != last_sent_assistant[0] and len(final) > len(last_sent_assistant[0]):
-            dialog_log.log_agent_chunk(chat_id, final)
-            to_send = _queue_outbound_markers(final)
-            _flush_outbound(chat_id)
-            safe_send_message(chat_id, to_send or final)
+    _, session_id = _parse_session_and_final_output(full_stdout, full_stderr, returncode)
     if not session_id:
         session_id = resume_session
     return session_id
@@ -753,13 +907,15 @@ def _handle_control(chat_id: int, text: str) -> bool:
 
     if lower == "/mode":
         active = named_sessions.get_active_name()
+        armed = _ARMED_MODE or "(нет)"
         safe_send_message(
             chat_id,
-            "Default mode: `%s`\nActive named: `%s`\n"
+            "Default mode: `%s`\nArmed (след. сообщение): `%s`\nActive named: `%s`\n"
             "Mode sessions: ask=%s, plan=%s, agent=%s\n\n"
             "%s"
             % (
                 _DEFAULT_MODE,
+                armed,
                 active or "(none)",
                 "yes" if _MODE_SESSIONS.get("ask") else "no",
                 "yes" if _MODE_SESSIONS.get("plan") else "no",
@@ -767,6 +923,22 @@ def _handle_control(chat_id: int, text: str) -> bool:
                 named_sessions.session_help_text(),
             ),
         )
+        return True
+
+    if parts and parts[0].lower() in ("/ask", "/plan", "/agent") and len(parts) == 1:
+        mode = parts[0][1:].lower()
+        _set_armed_mode(mode)
+        safe_send_message(chat_id, _armed_mode_reply(mode))
+        return True
+
+    if lower == "/new":
+        safe_send_message(chat_id, "Укажите имя: `/new bugfix`")
+        return True
+    if lower == "/use":
+        safe_send_message(chat_id, "Укажите имя: `/use bugfix` (список: /sessions)")
+        return True
+    if lower in ("/drop", "/delete"):
+        safe_send_message(chat_id, "Укажите имя или `all`: `/drop имя`")
         return True
 
     if lower == "/newchat":
@@ -784,6 +956,7 @@ def _handle_control(chat_id: int, text: str) -> bool:
             for mode in ("ask", "plan", "agent"):
                 _save_session(mode, None)
             named_sessions.clear_active()
+            _clear_armed_mode()
             safe_send_message(
                 chat_id,
                 "Сброшено: ask/plan/agent sessions + active именованная.\n"
@@ -800,6 +973,7 @@ def _handle_control(chat_id: int, text: str) -> bool:
             for mode in ("ask", "plan", "agent"):
                 _save_session(mode, None)
             named_sessions.clear_active()
+            _clear_armed_mode()
             safe_send_message(chat_id, "Mode sessions + active cleared.")
             return True
         try:
@@ -929,13 +1103,19 @@ def _process_updates(updates: List[dict]) -> int:
 
     mode = _DEFAULT_MODE
     prompt_parts: List[str] = []
+    mode_from_prefix = False
     for t in batch_texts:
         m, body, _ = parse_mode_and_text(t)
         if body:
             mode = m
+            mode_from_prefix = m != _DEFAULT_MODE
             prompt_parts.append(body)
         elif m != _DEFAULT_MODE:
             mode = m
+            mode_from_prefix = True
+
+    if not mode_from_prefix and _ARMED_MODE:
+        mode = _ARMED_MODE
 
     if force_ask:
         mode = "ask"
@@ -960,6 +1140,8 @@ def _process_updates(updates: List[dict]) -> int:
 
     if not text.strip():
         return new_offset
+
+    _clear_armed_mode()
 
     print(
         "Running agent mode=%s active=%s prompt: %s..."

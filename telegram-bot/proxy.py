@@ -53,11 +53,16 @@ def open_url(request: urllib.request.Request, timeout: float = 60):
     for proxy_url in _PROXY_URLS:
         try:
             return _open_via_socks(request, proxy_url, timeout)
+        except urllib.error.HTTPError:
+            # Reached Telegram but request rejected (e.g. bad Markdown) — not a proxy issue.
+            raise
         except Exception as exc:
             errors.append("%s: %s" % (proxy_url, exc))
     if _PROXY_URLS:
         try:
             return _open_direct(request, timeout)
+        except urllib.error.HTTPError:
+            raise
         except Exception as exc:
             errors.append("direct: %s" % exc)
             raise urllib.error.URLError(
